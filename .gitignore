@@ -56,4 +56,4 @@ cython_debug/
 rl_ad_bid_agent_*
 mlp_bid_model_*
 
-*.pth
+/*.pth
