@@ -280,7 +280,7 @@ class RuleBasedCampaignsAgent(NDaysNCampaignsAgent):
 
 if __name__ == "__main__":
     # Here's an opportunity to test offline against some TA agents. Just run this file to do so.
-    test_agents = [BaselineAgent()] + [Tier1NDaysNCampaignsAgent(name=f"Agent {i + 1}") for i in range(9)]
+    test_agents = [BaselineAgent()] + [Tier1NDaysNCampaignsAgent(name=f"Agent {i + 1}") for i in range(1)]
 
     # # Don't change this. Adapt initialization to your environment
     simulator = AdXGameSimulator()

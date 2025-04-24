@@ -6,16 +6,13 @@ from collections import deque
 
 import torch, torch.nn as nn, torch.nn.functional as F, torch.optim as optim
 from torch.distributions import Normal
+import numpy as np
 
 # ─────────────  GAME API  ─────────────
 from agt_server.agents.base_agents.adx_agent import NDaysNCampaignsAgent
 from agt_server.agents.utils.adx.structures import Bid, BidBundle, Campaign, MarketSegment
 from agt_server.agents.test_agents.adx.tier1.my_agent import Tier1NDaysNCampaignsAgent
 from agt_server.local_games.adx_arena import AdXGameSimulator
-
-import numpy as np
-
-from baseline_agents import RandomCampaignsAgent, BaselineAgent, RuleBasedCampaignsAgent
 
 # ══════════════════════════════════════
 # 1. replay buffer
@@ -630,18 +627,6 @@ def evaluate_v2(ckpt_file: str, num_runs: int = 500):
     sim        = AdXGameSimulator()
     foes       = [Tier1NDaysNCampaignsAgent(name=f"T1-0")]
 
-    sim.run_simulation([eval_agent] + foes, num_simulations=num_runs)
-    
-def evaluate_v3(ckpt_file: str, num_runs: int = 500):
-    eval_agent = SACPerCampaign(ckpt=ckpt_file, inference=True)
-    sim        = AdXGameSimulator()
-    agents       = [RandomCampaignsAgent(),
-                    BaselineAgent(),
-                    RuleBasedCampaignsAgent()]
-    foes = [Tier1NDaysNCampaignsAgent(name=f"T1-{i}") for i in range(6)]
-    
-    foes += agents
-    
     sim.run_simulation([eval_agent] + foes, num_simulations=num_runs)
 
 
