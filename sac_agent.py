@@ -3,6 +3,7 @@ import random
 from typing import Set, Dict, List, Tuple
 import collections
 from torch.distributions import Normal
+from collections import deque
 
 import torch
 import torch.nn as nn
@@ -168,9 +169,9 @@ class MyNDaysNCampaignsAgent(NDaysNCampaignsAgent):
         self.prev_reach: Dict[int, int] = {}
         
         self.inference = inference
-        if ckpt_path is not None:
+        if ckpt_path is not None and inference:
+            # load checkpoint if provided
             self._load_checkpoint(ckpt_path)
-            
             
         self.MAX_CAMPAIGNS = 10          # expected upper-bound in a 10-agent game
         self.GAME_LENGTH   = 10.0        # days
@@ -470,17 +471,33 @@ class MyNDaysNCampaignsAgent(NDaysNCampaignsAgent):
 # ════════════════════════════════════════════════════════════════════
 # 4.  TRAINING LOOP (unchanged – now drives SAC)
 # ════════════════════════════════════════════════════════════════════
-def train_rl_ad_bidding(agent: MyNDaysNCampaignsAgent, num_episodes: int = 500, ckpt_file: str = "sac_ad_bidding.pth"):
+def train(eps: int, ckpt: str, ma_window: int = 100):
+    ag = MyNDaysNCampaignsAgent()
     sim = AdXGameSimulator()
-    opponents = [Tier1NDaysNCampaignsAgent(name=f"Tier-1-{i+1}") for i in range(9)]
-
-    for ep in range(1, num_episodes + 1):
-        sim.run_simulation([agent] + opponents, num_simulations=1)
-        agent.on_new_game()
-        print(f"Episode {ep} finished, replay buffer size = {len(agent.buffer)}")
-
-    agent._save_checkpoint(ckpt_file)
-    print(f"Saved trained weights → {ckpt_file}")
+    foes = [Tier1NDaysNCampaignsAgent(name=f"T1-{i}") for i in range(9)]
+    
+    ma_queue = deque(maxlen=ma_window)
+    
+    for ep in range(1, eps + 1):
+        sim.run_simulation([ag] + foes, num_simulations=1)
+        
+        # 2. get final profit and update moving average
+        profit = ag.get_cumulative_profit()
+        ma_queue.append(profit)
+        ma = sum(ma_queue) / len(ma_queue)
+        
+        # 3. print stats
+        print(
+            f"[train] Ep {ep}/{eps}  "
+            f"Buf={len(ag.buffer):5d}  "
+            f"Profit={profit:7.2f}  "
+            f"MA{ma_window}={ma:7.2f}"
+        )
+        
+        ag.on_new_game()
+        
+    ag._save_checkpoint(ckpt)
+    print("✔ saved", ckpt)
 
 
 def evaluate_sac(ckpt_file: str, num_runs: int = 500):
@@ -505,5 +522,5 @@ if __name__ == "__main__":
     if args.eval_only:
         evaluate_sac(args.ckpt, args.eval_runs)
     else:
-        train_rl_ad_bidding(sac_agent, args.train_eps, args.ckpt)
+        train(args.train_eps, args.ckpt)
         evaluate_sac(args.ckpt, args.eval_runs)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import math, random, argparse, collections
 from typing import Dict, List, Set, Tuple
+from collections import deque
 
 import torch, torch.nn as nn, torch.nn.functional as F, torch.optim as optim
 from torch.distributions import Normal
@@ -17,7 +18,6 @@ from agt_server.local_games.adx_arena import AdXGameSimulator
 Transition = collections.namedtuple(
     "Transition", ("state", "action", "reward", "next_state", "done")
 )
-
 
 class ReplayBuffer:
     def __init__(self, cap: int = 50_000):
@@ -112,7 +112,7 @@ class SACPerCampaign(NDaysNCampaignsAgent):
         super().__init__()
         self.name, self.device = "SAC_PC", torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        hid = 128
+        hid = 256 # v1 - 128, test - 256
         self.actor = GaussianPolicy(self.S_DIM, hid, self.A_DIM).to(self.device)
         self.q1 = QNet(self.S_DIM, self.A_DIM, hid).to(self.device)
         self.q2 = QNet(self.S_DIM, self.A_DIM, hid).to(self.device)
@@ -121,16 +121,18 @@ class SACPerCampaign(NDaysNCampaignsAgent):
         self.t1.load_state_dict(self.q1.state_dict())
         self.t2.load_state_dict(self.q2.state_dict())
 
-        lr = 3e-4
-        self.o_actor = optim.Adam(self.actor.parameters(), lr)
-        self.o_q1 = optim.Adam(self.q1.parameters(), lr)
-        self.o_q2 = optim.Adam(self.q2.parameters(), lr)
+        a_lr = 2e-4
+        q_lr = 3e-4
+        self.o_actor = optim.Adam(self.actor.parameters(), a_lr)
+        self.o_q1 = optim.Adam(self.q1.parameters(), q_lr)
+        self.o_q2 = optim.Adam(self.q2.parameters(), q_lr)
         self.log_alpha = torch.tensor(0.0, device=self.device, requires_grad=True)
-        self.o_alpha = optim.Adam([self.log_alpha], lr)
+        self.o_alpha = optim.Adam([self.log_alpha], 1e-4)
 
-        self.gamma, self.tau = 0.99, 0.005
-        self.batch, self.update_after, self.updates_ps = 128, 100, 4
-        self.target_entropy = -float(self.A_DIM)
+        self.gamma, self.tau = 0.995, 0.003
+        self.batch, self.update_after, self.updates_ps = 256, 512, 6
+        self.policy_delay = 2
+        self.target_entropy = -float(self.A_DIM / 2)
         self.buffer = ReplayBuffer(50_000)
         self.total_steps = 0
         self.inference = inference
@@ -138,7 +140,7 @@ class SACPerCampaign(NDaysNCampaignsAgent):
         # per-campaign log of previous-day choices
         self.mem: Dict[int, SACPerCampaign.MemEntry] = {}
 
-        if ckpt:
+        if ckpt and inference:
             self._load(ckpt)
             self.inference = True
 
@@ -166,7 +168,7 @@ class SACPerCampaign(NDaysNCampaignsAgent):
         self.log_alpha.data.copy_(ck["log_alpha"])
 
     # ── campaign-level state ───────────────────────────────────────────
-    def _state_c(self, c: Campaign) -> torch.Tensor:
+    def _state_c(self, c: Campaign, avg_p, min_p, max_p, n_norm) -> torch.Tensor:
         """
         Return an 8-dim vector describing the current campaign *c* in context:
             [0] day_norm                    ∈ [0,1]
@@ -178,49 +180,17 @@ class SACPerCampaign(NDaysNCampaignsAgent):
             [6] remaining_budget_ratio_c    ∈ [0,1]
             [7] quality_score               ∈ [0,1.38]
         """
-        # ----- global scalars -------------------------------------------------
-        day_norm = self.get_current_day() / GAME_LENGTH
-        actives  = list(self.get_active_campaigns())
-        n_norm   = len(actives) / MAX_CAMPAIGNS if MAX_CAMPAIGNS else 0.0
-
-        # ----- progress stats across campaigns --------------------------------
-        progresses: List[float] = []
-        for camp in actives:
-            p = self.get_cumulative_reach(camp) / max(1, camp.reach)
-            progresses.append(p)
-
-        if progresses:
-            avg_prog = sum(progresses) / len(progresses)
-            min_prog = min(progresses)
-            max_prog = max(progresses)
-        else:           # degenerate case: no active campaigns
-            avg_prog = min_prog = max_prog = 0.0
-
-        # ----- per-campaign features ------------------------------------------
-        cum_reach  = self.get_cumulative_reach(c)
-        cum_cost   = self.get_cumulative_cost(c)
-        prog_c     = cum_reach / max(1, c.reach)
-        rem_budget = (c.budget - cum_cost) / max(1.0, c.budget)
-
-        days_left  = max(1, c.end_day - self.get_current_day() + 1)
-        urgency    = 1.0 / days_left                     # ↑ when few days remain
-
-        # ----- build tensor ----------------------------------------------------
+        day_n = self.get_current_day() / GAME_LENGTH
+        r     = self.get_cumulative_reach(c)
+        cost  = self.get_cumulative_cost(c)
+        prog  = r / max(1, c.reach)
+        rem_b = (c.budget - cost) / max(1.0, c.budget)
+        urg   = 1.0 / max(1, c.end_day - self.get_current_day() + 1)
+        qs    = self.get_quality_score()
         return torch.tensor(
-            [
-                day_norm,          # [0]
-                n_norm,            # [1]
-                avg_prog,          # [2]
-                min_prog,          # [3]
-                max_prog,          # [4]
-                prog_c * urgency,  # [5]
-                rem_budget,        # [6]
-                self.get_quality_score(),  # [7]
-            ],
-            dtype=torch.float32,
-            device=self.device,
+            [day_n, n_norm, avg_p, min_p, max_p, prog * urg, rem_b, qs],
+            dtype=torch.float32, device=self.device
         )
-
 
     # ── reset episode mem ──
     def on_new_game(self):
@@ -229,13 +199,21 @@ class SACPerCampaign(NDaysNCampaignsAgent):
     # ── main bidding function ──
     def get_ad_bids(self) -> Set[BidBundle]:
         bundles: Set[BidBundle] = set()
+        
+        day    = self.get_current_day()
+        active = list(self.get_active_campaigns())
+        # cache global progress stats
+        progs = [self.get_cumulative_reach(c) / max(1, c.reach) for c in active] or [0.0]
+        avg_p, min_p, max_p = sum(progs)/len(progs), min(progs), max(progs)
+        n_norm = len(active) / MAX_CAMPAIGNS
 
+        active_map = {c.uid: c for c in active}
         # 1.  compute reward for campaigns we bid on yesterday
         for uid, m in list(self.mem.items()):
             # It might have ended and vanished from active list; retrieve via stored uid
-            camp = next((c for c in self.get_active_campaigns() if c.uid == uid), None)
-            
-            if camp is None:
+            camp = active_map.get(uid)
+                      
+            if camp is None or day > camp.end_day:
                 # use last known state; reward is zero because reach & cost no longer change
                 self.buffer.push(m.state, m.action, 0.0,
                                 torch.zeros_like(m.state), 1.0)
@@ -250,12 +228,25 @@ class SACPerCampaign(NDaysNCampaignsAgent):
             eff_new = self.effective_reach(new_reach, camp.reach)
             reward = (eff_new - eff_prev) * camp.budget - delta_cost
             
-            # NaN / inf guard
-            if not math.isfinite(reward):
-                reward = 0.0
-
+            # normalize reward to ≈O(1)
+            # r_tensor = torch.tensor([raw_reward], device=self.device)
+            # r_norm   = (r_tensor - r_tensor.mean()) / (r_tensor.std() + 1e-6)
+            # reward   = float(r_norm.item()) if math.isfinite(r_norm.item()) else 0.0
+            
             done = float(self.get_current_day() > camp.end_day)
-            next_state = self._state_c(camp) if not done else torch.zeros(m.state, dtype=torch.float32, device=self.device)
+            next_state = (torch.zeros_like(m.state) if done else self._state_c(camp, avg_p, min_p, max_p, n_norm))
+
+            # print(f"uid={uid}  "
+            #         f"day={day}  "
+            #         f"prev_reach={m.prev_reach:.2f}  "
+            #         f"new_reach={new_reach:.2f}  "
+            #         f"prev_cost={m.prev_cost:.2f}  "
+            #         f"new_cost={new_cost:.2f}  "
+            #         f"reward={reward:.2f}  "
+            #         f"action={m.action}  "
+            #         f"prev_state={m.state}  "
+            #         f"next_state={next_state}  "
+            #         f"done={done:.2f}  ")
 
             self.buffer.push(m.state, 
                              m.action, 
@@ -271,14 +262,14 @@ class SACPerCampaign(NDaysNCampaignsAgent):
                 self.mem[uid] = m._replace(prev_reach=new_reach, prev_cost=new_cost)
 
         # 2. choose action for each currently active campaign
-        for c in self.get_active_campaigns():
+        for c in active:
             cum, cost = self.get_cumulative_reach(c), self.get_cumulative_cost(c)
             
             if cum >= c.reach or cost >= c.budget:  # no need to bid
                 self.mem.pop(c.uid, None)
                 continue
 
-            s_c = self._state_c(c).unsqueeze(0)
+            s_c = self._state_c(c, avg_p, min_p, max_p, n_norm).unsqueeze(0)
             
             with torch.no_grad():
                 if self.inference:
@@ -298,10 +289,6 @@ class SACPerCampaign(NDaysNCampaignsAgent):
             
             bid = float(min(max(base * bid_mul, 0.1), rem_budget)) # clip to [0.1, rem_budget]
             limit = float(min(max(rem_budget * lim_mul, bid), rem_budget)) # clip to [bid, rem_budget]
-            
-            # final sanity check
-            if not (math.isfinite(bid) and math.isfinite(limit)):
-                continue      # skip insane numbers gracefully
 
             bid_entry = Bid(self, c.target_segment, bid, limit)
             bundles.add(BidBundle(c.uid, limit, {bid_entry}))
@@ -316,12 +303,6 @@ class SACPerCampaign(NDaysNCampaignsAgent):
                 uid=c.uid,
             )
             
-        # If no bids were produced we still need to learn
-        if not bundles:
-            # to keep replay buffer fresh, call _learn() anyway
-            self._learn()
-            return set()
-
         # learn from replay buffer
         self._learn()
         return bundles
@@ -341,50 +322,113 @@ class SACPerCampaign(NDaysNCampaignsAgent):
         return bids
 
     # ── SAC update ──
-    def _learn(self):
-        if self.inference or len(self.buffer) < self.update_after: 
+    def _learn(self, training_method = "smooth"):
+        if self.inference or len(self.buffer) < max(self.batch, self.update_after):
             return
         
-        for _ in range(self.updates_ps):
-            s, a, r, s2, d = self.buffer.sample(self.batch)
+        if training_method == "smooth":
+            for _ in range(self.updates_ps):
+                s, a, r, s2, d = self.buffer.sample(self.batch)
 
-            with torch.no_grad():
-                a2, lp2 = self.actor.sample(s2)
-                y = r + self.gamma * (1 - d) * (torch.min(self.t1(s2, a2), self.t2(s2, a2)) - self.alpha * lp2)
-
-            # critics
-            for qnet, opt, target in ((self.q1, self.o_q1, self.t1), (self.q2, self.o_q2, self.t2)):
-                loss = F.mse_loss(qnet(s, a), y)
-                opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(qnet.parameters(), 5); opt.step()
+                # target policy smoothing
                 with torch.no_grad():
-                    for p, tp in zip(qnet.parameters(), target.parameters()):
-                        tp.data.mul_(1 - self.tau).add_(self.tau * p.data)
+                    a2, lp2 = self.actor.sample(s2)
+                    noise   = torch.randn_like(a2)*0.2
+                    a2      = (a2 + noise.clamp(-0.5,0.5)).clamp(-1,1)
+                    target_q= torch.min(self.t1(s2,a2), self.t2(s2,a2))
+                    y = r + self.gamma*(1-d)*(target_q - self.alpha*lp2)
 
-            # actor
-            an, lpn = self.actor.sample(s)
-            actor_loss = (self.alpha * lpn - torch.min(self.q1(s, an), self.q2(s, an))).mean()
-            self.o_actor.zero_grad(); actor_loss.backward(); nn.utils.clip_grad_norm_(self.actor.parameters(), 5); self.o_actor.step()
+                # update critics
+                for q, opt, targ in ((self.q1,self.o_q1,self.t1),(self.q2,self.o_q2,self.t2)):
+                    loss = F.mse_loss(q(s,a), y)
+                    opt.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(q.parameters(),5)
+                    opt.step()
+                    with torch.no_grad():
+                        for p, tp in zip(q.parameters(), targ.parameters()):
+                            tp.data.mul_(1-self.tau).add_(self.tau*p.data)
 
-            # α
-            alpha_loss = -(self.log_alpha * (lpn + self.target_entropy).detach()).mean()
-            self.o_alpha.zero_grad(); alpha_loss.backward(); self.o_alpha.step()
+                # delayed actor & alpha
+                if self.total_steps % self.policy_delay == 0:
+                    an, lp = self.actor.sample(s)
+                    q_min  = torch.min(self.q1(s,an), self.q2(s,an))
+                    a_loss = (self.alpha*lp - q_min).mean()
+                    self.o_actor.zero_grad()
+                    a_loss.backward()
+                    nn.utils.clip_grad_norm_(self.actor.parameters(),5)
+                    self.o_actor.step()
+
+                    alpha_loss = -(self.log_alpha*(lp + self.target_entropy).detach()).mean()
+                    self.o_alpha.zero_grad()
+                    alpha_loss.backward()
+                    self.o_alpha.step()
+        else:
+            for _ in range(self.updates_ps):
+                s, a, r, s2, d = self.buffer.sample(self.batch)
+
+                with torch.no_grad():
+                    a2, lp2 = self.actor.sample(s2)
+                    y = r + self.gamma * (1 - d) * (torch.min(self.t1(s2, a2), self.t2(s2, a2)) - self.alpha * lp2)
+
+                # critics
+                for qnet, opt, target in ((self.q1, self.o_q1, self.t1), (self.q2, self.o_q2, self.t2)):
+                    loss = F.mse_loss(qnet(s, a), y)
+                    opt.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(qnet.parameters(), 5)
+                    opt.step()
+                    with torch.no_grad():
+                        for p, tp in zip(qnet.parameters(), target.parameters()):
+                            tp.data.mul_(1 - self.tau).add_(self.tau * p.data)
+
+                # actor
+                an, lpn = self.actor.sample(s)
+                actor_loss = (self.alpha * lpn - torch.min(self.q1(s, an), self.q2(s, an))).mean()
+                self.o_actor.zero_grad()
+                actor_loss.backward()
+                nn.utils.clip_grad_norm_(self.actor.parameters(), 5)
+                self.o_actor.step()
+
+                # α
+                alpha_loss = -(self.log_alpha * (lpn + self.target_entropy).detach()).mean()
+                self.o_alpha.zero_grad()
+                alpha_loss.backward()
+                self.o_alpha.step()
+                
+        self.total_steps += 1
 
 
 # ══════════════════════════════════════
 # 4. training / evaluation helpers
 # ══════════════════════════════════════
-def train(eps: int, ckpt: str):
+def train(eps: int, ckpt: str, ma_window: int = 100):
     ag = SACPerCampaign()
     sim = AdXGameSimulator()
     foes = [Tier1NDaysNCampaignsAgent(name=f"T1-{i}") for i in range(9)]
+    
+    ma_queue = deque(maxlen=ma_window)
+    
     for ep in range(1, eps + 1):
         sim.run_simulation([ag] + foes, num_simulations=1)
+        
+        # 2. get final profit and update moving average
+        profit = ag.get_cumulative_profit()
+        ma_queue.append(profit)
+        ma = sum(ma_queue) / len(ma_queue)
+        
+        # 3. print stats
+        print(
+            f"[train] Ep {ep}/{eps}  "
+            f"Buf={len(ag.buffer):5d}  "
+            f"Profit={profit:7.2f}  "
+            f"MA{ma_window}={ma:7.2f}"
+        )
+        
         ag.on_new_game()
-        if ep % 50 == 0: 
-            print(f"[train] {ep}/{eps}, buf={len(ag.buffer)}")
+        
     ag._save(ckpt)
     print("✔ saved", ckpt)
-
 
 def evaluate(ckpt_file: str, num_runs: int = 500):
     eval_agent = SACPerCampaign(ckpt=ckpt_file, inference=True)
