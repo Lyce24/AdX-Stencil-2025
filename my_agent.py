@@ -14,8 +14,8 @@ from agt_server.agents.test_agents.adx.tier1.my_agent import Tier1NDaysNCampaign
 from agt_server.local_games.adx_arena import AdXGameSimulator
 
 import numpy as np
-from .path_utils import path_from_local_root
-
+# from .path_utils import path_from_local_root # For submission
+from path_utils import path_from_local_root  # For regular use
 
 # ══════════════════════════════════════
 # 1. replay buffer
@@ -270,6 +270,7 @@ class SACPerCampaign(NDaysNCampaignsAgent):
     def _load(self, f):
         # For submission
         ckpt_path = path_from_local_root(f)
+        print("Loading checkpoint from", ckpt_path)
         ck = torch.load(ckpt_path, map_location=self.device)
 
         # ck = torch.load(f, map_location=self.device)
@@ -421,10 +422,14 @@ class SACPerCampaign(NDaysNCampaignsAgent):
             rem_budget = max(1e-6, c.budget - cost)
             
             base = rem_budget / rem_reach
-            base = float(min(max(base, 0.1), rem_budget)) # clip to [0.1, rem_budget]
+            base = float(np.clip(base, 0.10, 10.0))       # 10 USD CPM hard-cap
+            bid = float(np.clip(base * bid_mul, 0.10, min(10.0, rem_budget)))
+            limit = float(np.clip(rem_budget * lim_mul, bid, rem_budget))
             
-            bid = float(min(max(base * bid_mul, 0.1), rem_budget)) # clip to [0.1, rem_budget]
-            limit = float(min(max(rem_budget * lim_mul, bid), rem_budget)) # clip to [bid, rem_budget]
+            # base = rem_budget / rem_reach
+            # base = float(min(max(base, 0.1), rem_budget)) # clip to [0.1, rem_budget] ?
+            # bid = float(min(max(base * bid_mul, 0.1), rem_budget)) # clip to [0.1, rem_budget]
+            # limit = float(min(max(rem_budget * lim_mul, bid), rem_budget)) # clip to [bid, rem_budget] ?
 
             bid_entry = Bid(self, c.target_segment, bid, limit)
             bundles.add(BidBundle(c.uid, limit, {bid_entry}))
@@ -489,8 +494,6 @@ class SACPerCampaign(NDaysNCampaignsAgent):
                     
                     # print(f"Actor loss: {a_loss.item():.4f}")
                     # print(f"Alpha loss: {alpha_loss.item():.4f}")
-                    
-                
         else:
             for _ in range(self.updates_ps):
                 s, a, r, s2, d = self.buffer.sample(self.batch)
@@ -638,7 +641,7 @@ def evaluate_v2(ckpt_file: str, num_runs: int = 500):
 
     sim.run_simulation([eval_agent] + foes, num_simulations=num_runs)
 
-my_agent_submission = SACPerCampaign(ckpt='./model_checkpoints/sac_pc_v2_sv_12_sd_popart_sa.pth', inference=True)
+# my_agent_submission = SACPerCampaign(ckpt='./model_checkpoints/sac_pc_v2_sv_12_sd_popart_sa.pth', inference=True)
 
 # ══════════════════════════════════════
 # 5. CLI
