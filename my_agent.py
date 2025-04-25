@@ -14,8 +14,8 @@ from agt_server.agents.test_agents.adx.tier1.my_agent import Tier1NDaysNCampaign
 from agt_server.local_games.adx_arena import AdXGameSimulator
 
 import numpy as np
-
 from .path_utils import path_from_local_root
+
 
 # ══════════════════════════════════════
 # 1. replay buffer
@@ -173,9 +173,10 @@ class SACPerCampaign(NDaysNCampaignsAgent):
         "MemEntry", ("state", "action", "prev_reach", "prev_cost", "end_day", "uid")
     )
 
-    def __init__(self, ckpt: str | None = None, inference=False, submission=False):
+    def __init__(self, ckpt: str | None = None, inference=False):
         super().__init__()
-        self.name, self.device = "SAC_PC", torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.name = "SAC_PC"
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         hid = 256
         self.actor = GaussianPolicy(self.S_DIM, hid, self.A_DIM).to(self.device)
@@ -254,8 +255,6 @@ class SACPerCampaign(NDaysNCampaignsAgent):
 
         self.TOTAL_DAILY_USERS = 10_000        # given in the hand-out
         
-        self.submission = submission
-
     # ── α helper ──
     @property
     def alpha(self):
@@ -270,11 +269,10 @@ class SACPerCampaign(NDaysNCampaignsAgent):
 
     def _load(self, f):
         # For submission
-        if self.submission:
-            ckpt_path = path_from_local_root(f)
-            ck = torch.load(ckpt_path, map_location=self.device)
-        else:
-            ck = torch.load(f, map_location=self.device)
+        ckpt_path = path_from_local_root(f)
+        ck = torch.load(ckpt_path, map_location=self.device)
+
+        # ck = torch.load(f, map_location=self.device)
             
         self.actor.load_state_dict(ck["actor"])
         self.q1.load_state_dict(ck["q1"])
@@ -640,7 +638,7 @@ def evaluate_v2(ckpt_file: str, num_runs: int = 500):
 
     sim.run_simulation([eval_agent] + foes, num_simulations=num_runs)
 
-my_agent_submission = SACPerCampaign(ckpt='./model_checkpoints/sac_pc_v2_sv_12_sd_popart_sa.pth', inference=True, submission=True)
+my_agent_submission = SACPerCampaign(ckpt='./model_checkpoints/sac_pc_v2_sv_12_sd_popart_sa.pth', inference=True)
 
 # ══════════════════════════════════════
 # 5. CLI
