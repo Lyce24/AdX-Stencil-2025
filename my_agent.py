@@ -15,7 +15,7 @@ from agt_server.local_games.adx_arena import AdXGameSimulator
 
 import numpy as np
 
-from path_utils import path_from_local_root
+from .path_utils import path_from_local_root
 
 # ══════════════════════════════════════
 # 1. replay buffer
