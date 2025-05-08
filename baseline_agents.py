@@ -7,6 +7,7 @@ from agt_server.agents.base_agents.adx_agent import NDaysNCampaignsAgent
 from agt_server.agents.test_agents.adx.tier1.my_agent import Tier1NDaysNCampaignsAgent
 from agt_server.local_games.adx_arena import AdXGameSimulator
 from agt_server.agents.utils.adx.structures import Bid, Campaign, BidBundle
+import numpy as np
 
 
 # class MyNDaysNCampaignsAgent(NDaysNCampaignsAgent):
@@ -35,9 +36,9 @@ from agt_server.agents.utils.adx.structures import Bid, Campaign, BidBundle
 
 class RandomCampaignsAgent(NDaysNCampaignsAgent):
 
-    def __init__(self):
+    def __init__(self, name: str = "RandomCampaignsAgent"):
         super().__init__()
-        self.name = "Random_Baseline"  # A unique name for your agent.
+        self.name = name
 
     def on_new_game(self) -> None:
         # This baseline agent does not store per-game state.
@@ -103,9 +104,9 @@ class RandomCampaignsAgent(NDaysNCampaignsAgent):
     
 class BaselineAgent(NDaysNCampaignsAgent):
 
-    def __init__(self):
+    def __init__(self, name = "BaselineAgent"):
         super().__init__()
-        self.name = "Baseline"  # A unique name for your agent.
+        self.name = name
 
     def on_new_game(self) -> None:
         # This baseline agent does not store per-game state.
@@ -129,16 +130,23 @@ class BaselineAgent(NDaysNCampaignsAgent):
                 continue
             
             # Compute a baseline bid per impression.
-            baseline_bid = max(0.1, remaining_budget / max(1, remaining_reach))
-            
+            base = remaining_budget / remaining_reach
+            base = float(np.clip(base, 0.10, 10.0))       # 10 USD CPM hard-cap
+                        
             # Randomize the bid by multiplying with a random factor in [0.5, 1.5].
             random_factor = random.uniform(0.5, 1.5)
-            bid_per_item = baseline_bid * random_factor
+            bid_per_item = base * random_factor
             bid_per_item = max(0.1, bid_per_item)  # ensure the bid is not below the minimum
             
             # Randomize spending limit: choose a value between a minimum (e.g., half of remaining budget or at least 1)
             # and the remaining budget.
-            spending_limit = random.uniform(max(1.0, remaining_budget * 0.5), remaining_budget)
+            # Random spending limit: ensure low <= high
+            low  = min(remaining_budget, max(1.0, remaining_budget * 0.5))
+            high = remaining_budget
+            spending_limit = random.uniform(low, high)
+
+            # Guarantee you can actually pay that per-impression bid
+            spending_limit = max(spending_limit, bid_per_item)
             
             # Create a Bid object. The auction_item is the campaign's target market segment.
             bid_entry = Bid(
@@ -280,7 +288,7 @@ class RuleBasedCampaignsAgent(NDaysNCampaignsAgent):
 
 if __name__ == "__main__":
     # Here's an opportunity to test offline against some TA agents. Just run this file to do so.
-    test_agents = [BaselineAgent()] + [Tier1NDaysNCampaignsAgent(name=f"Agent {i + 1}") for i in range(1)]
+    test_agents = [BaselineAgent()] + [Tier1NDaysNCampaignsAgent(name=f"Agent {i + 1}") for i in range(8)]
 
     # # Don't change this. Adapt initialization to your environment
     simulator = AdXGameSimulator()
