@@ -252,7 +252,7 @@ class SACPerCampaign(NDaysNCampaignsAgent):
         "MemEntry", ("state", "action", "prev_reach", "prev_cost", "end_day", "uid")
     )
 
-    def __init__(self, ckpt: str | None = None, inference=False, n_critics=5):
+    def __init__(self, ckpt: str | None = None, inference=False, n_critics=3):
         super().__init__()
         self.name = "SAC_PC"
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -404,6 +404,22 @@ class SACPerCampaign(NDaysNCampaignsAgent):
         self.mem.clear()
 
     # ── main bidding function ──
+    def get_segment_competitiveness(self, segment):
+        """
+        Returns a competitiveness score for a market segment.
+        Higher values indicate more competitive segments that should receive bonus rewards.
+        """
+        # Example implementation - you might want to customize this based on your strategy
+        segment_size = self.SEGMENT_FREQ.get(segment, 0)
+        total_users = self.TOTAL_DAILY_USERS
+        
+        # Smaller segments might be more valuable/competitive
+        if segment_size > 0:
+            return 1.0 + (1.0 - segment_size/total_users)
+        return 1.0  # Default value for unknown segments
+
+
+
     def get_ad_bids(self) -> Set[BidBundle]:
         bundles: Set[BidBundle] = set()
         
@@ -438,12 +454,60 @@ class SACPerCampaign(NDaysNCampaignsAgent):
                 new_reach = self.get_cumulative_reach(camp)
                 new_cost = self.get_cumulative_cost(camp)
                 
-                delta_cost = new_cost - m.prev_cost # change in cost
+
+                #--------------method 1-------------------
+                # delta_cost = new_cost - m.prev_cost # change in cost
+                # eff_prev = self.effective_reach(m.prev_reach, camp.reach)
+                # eff_new = self.effective_reach(new_reach, camp.reach)
+                
+                # raw_reward = (eff_new - eff_prev) * camp.budget - delta_cost # reward = budget * reach - cost
+                
+                #--------------method 5 (Optimized Method 1)-------------------
+                                # Base reward from method 1 (proven to work well)
+                delta_cost = new_cost - m.prev_cost
                 eff_prev = self.effective_reach(m.prev_reach, camp.reach)
                 eff_new = self.effective_reach(new_reach, camp.reach)
-                
                 raw_reward = (eff_new - eff_prev) * camp.budget - delta_cost # reward = budget * reach - cost
+
+                base_reward = (eff_new - eff_prev) * camp.budget - delta_cost
                 
+                # Add this to the reward calculation if you can identify regional preferences 
+                segment_competitiveness = self.get_segment_competitiveness(camp.target_segment) 
+                segment_bonus = (eff_new - eff_prev) * camp.budget * segment_competitiveness * 0.1 
+                raw_reward += segment_bonus
+                
+                # Add a smaller quality component - only when it matters
+                current_quality = self.get_quality_score() or 0.5
+                quality_bonus = 0.0
+                
+                # Only add quality bonus when quality is below 1.0 and improving
+                if hasattr(self, '_prev_quality') and current_quality < 1.0:
+                    quality_delta = current_quality - self._prev_quality
+                    if quality_delta > 0:
+                        # Smaller weight (0.1 instead of 0.2)
+                        quality_bonus = quality_delta * camp.budget * 0.1
+                self._prev_quality = current_quality
+                
+                # More targeted urgency factor - only for campaigns at risk of failing
+                days_remaining = max(1, camp.end_day - self.get_current_day())
+                progress_ratio = eff_new / 1.0  # Normalized progress (effective reach is already normalized)
+                urgency_bonus = 0.0
+                
+                # Only apply urgency to campaigns that are behind schedule
+                if days_remaining <= 2 and progress_ratio < 0.8:
+                    # Smaller weight (0.15 instead of 0.3)
+                    urgency_bonus = (eff_new - eff_prev) * camp.budget * 0.15
+                
+                # Combine rewards with base reward having highest weight
+                raw_reward = base_reward + quality_bonus + urgency_bonus
+
+
+                
+                # Clip extreme rewards to prevent instability
+                raw_reward = max(min(raw_reward, 1000), -1000)
+
+            
+
                 # Pop-Art normalization
                 reward = self.popart(torch.tensor([raw_reward], dtype=torch.float32, device=self.device))[0]
                 reward = reward.item()  # convert to scalar
@@ -487,6 +551,13 @@ class SACPerCampaign(NDaysNCampaignsAgent):
                     
             action = action.squeeze(0)
             bid_mul, lim_mul = 0.5 + 0.5 * action[0].item(), 0.5 + 0.5 * action[1].item()
+
+            ########## compute bid & limit
+            if hasattr(self, 'get_auction_round') and self.get_auction_round() > 1: 
+                # More aggressive in later rounds 
+                bid_mul *= 1.1
+                print("hasattr")
+            #########
 
             rem_reach = max(1, c.reach - cum)
             rem_budget = max(1e-6, c.budget - cost)
@@ -581,17 +652,207 @@ class SACPerCampaign(NDaysNCampaignsAgent):
                 )
         
     # ---------- rule-based campaign auction ----------
+    # def get_campaign_bids(self, campaigns_for_auction: Set[Campaign]) -> Dict[Campaign, float]:
+    #     bids = {}
+    #     day = self.get_current_day()
+    #     Q = self.get_quality_score()
+    #     for c in campaigns_for_auction:
+    #         min_bid = 0.1 * c.reach
+    #         max_bid = c.reach
+    #         base = min_bid if Q >= 1 else min_bid + (max_bid - min_bid) * (1 - Q)
+    #         if day >= 7:
+    #             base *= 1.15
+    #         bids[c] = self.clip_campaign_bid(c, base)
+    #     return bids
+    # def get_campaign_bids(self, campaigns_for_auction: Set[Campaign]) -> Dict[Campaign, float]:
+    #     bids = {}
+    #     day = self.get_current_day()
+    #     Q = self.get_quality_score()
+        
+    #     # Safety check for quality score
+    #     if Q is None:
+    #         Q = 0.5  # Default quality score if None
+        
+    #     # Track segment popularity to adjust bids
+    #     segment_counts = {}
+    #     for c in campaigns_for_auction:
+    #         if c.target_segment is not None:  # Safety check
+    #             segment = c.target_segment
+    #             segment_counts[segment] = segment_counts.get(segment, 0) + 1
+        
+    #     # Find most popular segment (with safety check)
+    #     max_count = max(segment_counts.values()) if segment_counts else 1
+        
+    #     for c in campaigns_for_auction:
+    #         # Safety checks for campaign attributes
+    #         if c.reach is None or c.budget is None or c.start_day is None or c.end_day is None:
+    #             continue  # Skip campaigns with missing attributes
+                
+    #         # Base bid calculation
+    #         min_bid = 0.1 * c.reach
+    #         max_bid = c.reach
+            
+    #         # Quality score adjustment
+    #         if Q >= 1:
+    #             base = min_bid
+    #         else:
+    #             base = min_bid + (max_bid - min_bid) * (1 - Q)
+            
+    #         # Day-based adjustment (bid more aggressively in later days)
+    #         if day >= 7:
+    #             base *= 1.2
+    #         elif day >= 5:
+    #             base *= 1.1
+            
+    #         # Segment popularity adjustment with safety check
+    #         segment_popularity = 0
+    #         if c.target_segment is not None and max_count > 0:
+    #             segment_popularity = segment_counts.get(c.target_segment, 0) / max_count
+            
+    #         # Bid more for less contested segments (better ROI opportunity)
+    #         # and slightly less for highly contested segments
+    #         popularity_factor = 1.0 - (segment_popularity * 0.2)  # 0.8-1.0 range
+    #         base *= popularity_factor
+            
+    #         # Campaign value assessment with safety checks
+    #         if c.reach > 0:  # Prevent division by zero
+    #             value_ratio = c.budget / c.reach  # Higher ratio means more valuable campaign
+                
+    #             # Calculate average value with safety checks
+    #             valid_campaigns = [camp for camp in campaigns_for_auction 
+    #                               if camp.reach is not None and camp.budget is not None and camp.reach > 0]
+                
+    #             if valid_campaigns:
+    #                 avg_value = sum(camp.budget / camp.reach for camp in valid_campaigns) / len(valid_campaigns)
+                    
+    #                 # Adjust bid based on campaign value (bid more for high-value campaigns)
+    #                 if value_ratio > avg_value * 1.2:
+    #                     base *= 1.15  # Premium for high-value campaigns
+    #                 elif value_ratio < avg_value * 0.8:
+    #                     base *= 0.9   # Discount for low-value campaigns
+            
+    #         # Final adjustments based on campaign duration
+    #         campaign_duration = c.end_day - c.start_day + 1
+    #         if campaign_duration <= 3:  # Short campaigns need quick action
+    #             base *= 1.1
+            
+    #         # Ensure base is a valid number
+    #         if base is None or not math.isfinite(base):
+    #             base = min_bid  # Fallback to minimum bid
+                
+    #         # Clip the bid to ensure it's valid
+    #         bids[c] = self.clip_campaign_bid(c, base)
+            
+    #     return bids
     def get_campaign_bids(self, campaigns_for_auction: Set[Campaign]) -> Dict[Campaign, float]:
         bids = {}
         day = self.get_current_day()
-        Q = self.get_quality_score()
+        Q = self.get_quality_score() or 0.5  # Default if None
+        
+        # Track segment popularity and value metrics
+        segment_counts = {}
+        segment_values = {}
+        total_campaigns = len(campaigns_for_auction)
+        
+        # First pass: gather statistics
         for c in campaigns_for_auction:
+            if c.reach is None or c.budget is None or c.start_day is None or c.end_day is None:
+                continue
+                
+            # Track segment popularity
+            if c.target_segment is not None:
+                segment = c.target_segment
+                segment_counts[segment] = segment_counts.get(segment, 0) + 1
+                
+                # Calculate value density (budget/reach ratio)
+                if c.reach > 0:
+                    value = c.budget / c.reach
+                    if segment not in segment_values:
+                        segment_values[segment] = []
+                    segment_values[segment].append(value)
+        
+        # Calculate segment value metrics
+        segment_avg_values = {}
+        for segment, values in segment_values.items():
+            segment_avg_values[segment] = sum(values) / len(values) if values else 0
+            
+        # Find most valuable segments (top 30%)
+        sorted_segments = sorted(segment_avg_values.items(), key=lambda x: x[1], reverse=True)
+        high_value_segments = set()
+        if sorted_segments:
+            cutoff = max(1, int(len(sorted_segments) * 0.3))
+            high_value_segments = {s[0] for s in sorted_segments[:cutoff]}
+        
+        # Second pass: calculate bids
+        for c in campaigns_for_auction:
+            if c.reach is None or c.budget is None or c.start_day is None or c.end_day is None:
+                continue
+                
+            # Base bid calculation with progressive scaling
             min_bid = 0.1 * c.reach
             max_bid = c.reach
-            base = min_bid if Q >= 1 else min_bid + (max_bid - min_bid) * (1 - Q)
-            if day >= 7:
+            
+            # Quality score adjustment - more aggressive when quality is lower
+            if Q >= 1:
+                base = min_bid
+            else:
+                # More aggressive bidding when quality is lower
+                base = min_bid + (max_bid - min_bid) * (1 - Q)**0.8
+            
+            # Day-based adjustment - more aggressive in later days
+            if day >= 8:
+                base *= 1.3  # Very aggressive in final days
+            elif day >= 6:
+                base *= 1.2  # More aggressive in later days
+            elif day >= 4:
+                base *= 1.1  # Slightly more aggressive in mid-game
+            
+            # Campaign duration adjustment - bid more for shorter campaigns
+            campaign_duration = c.end_day - c.start_day + 1
+            if campaign_duration <= 2:  # Very short campaigns
+                base *= 1.25
+            elif campaign_duration <= 4:  # Short campaigns
                 base *= 1.15
+            
+            # Value-based adjustment
+            if c.reach > 0:
+                value_ratio = c.budget / c.reach
+                
+                # Calculate average value across all campaigns
+                valid_campaigns = [camp for camp in campaigns_for_auction 
+                                  if camp.reach is not None and camp.budget is not None and camp.reach > 0]
+                
+                if valid_campaigns:
+                    avg_value = sum(camp.budget / camp.reach for camp in valid_campaigns) / len(valid_campaigns)
+                    
+                    # Bid more aggressively for high-value campaigns
+                    if value_ratio > avg_value * 1.5:
+                        base *= 1.25  # Significantly higher for very valuable campaigns
+                    elif value_ratio > avg_value * 1.2:
+                        base *= 1.15  # Higher for valuable campaigns
+                    elif value_ratio < avg_value * 0.7:
+                        base *= 0.85  # Lower for less valuable campaigns
+            
+            # Segment popularity and value-based adjustments
+            if c.target_segment is not None:
+                # Adjust for segment popularity
+                segment_popularity = segment_counts.get(c.target_segment, 0) / total_campaigns
+                
+                # Bid more for less contested segments
+                popularity_factor = 1.0 - (segment_popularity * 0.3)  # 0.7-1.0 range
+                base *= popularity_factor
+                
+                # Bid more for high-value segments
+                if c.target_segment in high_value_segments:
+                    base *= 1.15
+            
+            # Ensure base is a valid number
+            if base is None or not math.isfinite(base):
+                base = min_bid
+                
+            # Clip the bid to ensure it's valid
             bids[c] = self.clip_campaign_bid(c, base)
+            
         return bids
 
 # ══════════════════════════════════════
