@@ -14,8 +14,8 @@ from agt_server.agents.test_agents.adx.tier1.my_agent import Tier1NDaysNCampaign
 from agt_server.local_games.adx_arena import AdXGameSimulator
 
 import numpy as np
-# from .path_utils import path_from_local_root # For submission
-from path_utils import path_from_local_root  # For regular use
+from .path_utils import path_from_local_root # For submission
+# from path_utils import path_from_local_root  # For regular use
 
 # ══════════════════════════════════════
 # 1. replay buffer
@@ -595,6 +595,152 @@ class SACPerCampaign(NDaysNCampaignsAgent):
                 
     #     return bids
 
+class BaselineAgent(NDaysNCampaignsAgent):
+
+    def __init__(self, name = "BaselineAgent"):
+        super().__init__()
+        self.name = name
+        # For Campaign Segmentation
+        self.SEGMENT_FREQ = {
+            # --------- triple-attribute segments (8) ---------
+            MarketSegment({'Young','LowIncome', 'Male'}):    1836,
+            MarketSegment({'Young','HighIncome', 'Male'}):    517,
+            MarketSegment({'Old','LowIncome', 'Male'}):      1795,
+            MarketSegment({'Old','HighIncome', 'Male'}):      808,
+            MarketSegment({'Young','LowIncome', 'Female'}):  1980,
+            MarketSegment({'Young','HighIncome', 'Female'}):  256,
+            MarketSegment({'Old','LowIncome', 'Female'}):    2401,
+            MarketSegment({'Old','HighIncome', 'Female'}):    407,
+
+            # --------- double-attribute segments (12) --------
+            MarketSegment({'Young', 'Male'}):               2353,
+            MarketSegment({'Old','Male'}):                 2603,
+            MarketSegment({'Young', 'Female'}):             2236,
+            MarketSegment({'Old', 'Female'}):               2808,
+            MarketSegment({'Young','LowIncome'}):          3816,
+            MarketSegment({'Old','LowIncome'}):            4196,
+            MarketSegment({'Young','HighIncome'}):          773,
+            MarketSegment({'Old','HighIncome'}):           1215,
+            MarketSegment({'Male','LowIncome'}):           3631,
+            MarketSegment({'Female','LowIncome'}):         4381,
+            MarketSegment({'Male','HighIncome'}):          1325,
+            MarketSegment({'Female','HighIncome'}):         663,
+
+            # --------- single-attribute segments (6) ---------
+            MarketSegment({'Male'}):                       4956,
+            MarketSegment({'Female'}):                     5044,
+            MarketSegment({'Young'}):                      4589,
+            MarketSegment({'Old'}):                        5411,
+            MarketSegment({'LowIncome'}):                  8012,
+            MarketSegment({'HighIncome'}):                 1988,
+        }
+
+        # max simultaneous active campaigns
+        self.max_running = 10
+        
+        # Track previous cumulative reach & cost to compute daily deltas
+        # Keyed by campaign.uid
+
+    def on_new_game(self) -> None:
+        pass
+
+    def get_ad_bids(self) -> Set[BidBundle]:
+        bundles = set()
+        # Retrieve the active campaigns for which this agent is eligible to bid.
+        print(f"Day {self.get_current_day()}: {len(self.get_active_campaigns())} active campaigns, Cumulative Profit: {self.get_cumulative_profit()}")
+        active_campaigns = self.get_active_campaigns()
+        
+        if not active_campaigns:
+            return bundles
+        
+        today   = self.get_current_day()
+        Q       = self.get_quality_score()
+        
+        # For each active campaign, compute a randomized bid.
+        for camp in active_campaigns:
+            cumulative_reach = self.get_cumulative_reach(camp)
+            cumulative_cost = self.get_cumulative_cost(camp)
+            
+            rem_reach = camp.reach - cumulative_reach
+            rem_budget = camp.budget - cumulative_cost
+            seg = camp.target_segment
+            
+            # Skip bidding if the campaign is already fulfilled or there is no budget left.
+            if rem_reach <= 0 or rem_budget <= 0:
+                continue
+            
+            # # ───────── Pacing / urgency ─────────
+            V      = rem_budget / rem_reach        # advertiser's value CPI
+            # slack  = 1.0 - cumulative_reach / camp.reach        # 1 ⇒ just started, 0 ⇒ done
+            # days_left = max(1, camp.end_day - today + 1)
+
+            # # ───────── Base price & dynamic premium ─────────
+            base_cpi    = (rem_budget / rem_reach)
+            
+            # urgency  = 1.0 + 0.3 * slack / days_left             # ≤ 1+URGENCY_SLOPE
+            # bid_cpi = min(base_cpi * urgency, V)                # cap at value
+            
+            # jitter   = np.random.uniform(1 - 0.15, 1 + 0.15)
+            bid_mul = np.random.uniform(0.6, 1.0)
+            bid_cpi  = np.clip(base_cpi * bid_mul, 0.05, V)  # cap at value
+
+            cap_mul = np.random.uniform(0.8, 1.0)
+            spend_limit = max(bid_cpi,                              # ≥ cost of 1 impression
+                   min(rem_budget, bid_cpi * rem_reach * cap_mul))
+
+            bid = Bid(
+                bidder       = self,
+                auction_item = seg,
+                bid_per_item = bid_cpi,
+                bid_limit    = spend_limit
+            )
+            bundles.add(BidBundle(camp.uid, spend_limit, {bid}))         
+        
+        return bundles
+    
+    # ---------- rule-based campaign auction ----------
+    def get_campaign_bids(self, campaigns_for_auction: Set[Campaign]) -> Dict[Campaign, float]:
+        Q = self.get_quality_score()
+        
+        slots = self.max_running - len(self.get_active_campaigns())
+        if slots <= 0:
+            return {}
+
+        ranked = []
+
+        for c in campaigns_for_auction:
+            # ---------- basic constants -----------------------------------
+            D         = c.end_day - c.start_day + 1
+            seg       = c.target_segment
+            
+            # ---------- difficulty: share of daily inventory needed -------
+            supply    = self.SEGMENT_FREQ[seg]            # avg imp / day
+            frac      = c.reach / max(1, supply * D)            # 0 … >1
+            
+            if frac > 1.0:
+                continue                                 # infeasible campaign
+            
+            V = c.reach * 0.2           # assume $0.60 CPI, tune 0.4‑0.8
+            
+            diff_mul  = 1.00 + 0.3 * frac     # pay up to 25 % more for hard jobs
+
+            if np.random.rand() < 0.10:
+                diff_mul *= np.random.uniform(0.6, 0.9)  # learn cheap wins
+            
+            # ---------- one‑shot bid (bounded by budget) ------------------
+            raw_bid = V * diff_mul * Q
+            bid     = self.clip_campaign_bid(c, raw_bid)
+            
+            score = Q / diff_mul # q higher the better, diff_mul lower the better
+            ranked.append((score, c, bid))
+            
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        selected = ranked[:slots]
+        bids = {c: bid for _, c, bid in selected}
+        
+        return bids
+
+
 # ══════════════════════════════════════
 # 4. training / evaluation helpers
 # ══════════════════════════════════════
@@ -641,7 +787,8 @@ def evaluate_v2(ckpt_file: str, num_runs: int = 500):
 
     sim.run_simulation([eval_agent] + foes, num_simulations=num_runs)
 
-# my_agent_submission = SACPerCampaign(ckpt='./model_checkpoints/sac_pc_v2_sv_12_sd_popart_sa.pth', inference=True)
+
+my_agent_submission = BaselineAgent()
 
 # ══════════════════════════════════════
 # 5. CLI
