@@ -651,7 +651,7 @@ def evaluate_v2(ckpt_file: str, num_runs: int = 500):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--train_eps", type=int, default=1000)
-    p.add_argument("--ckpt", type=str, default="sac_pc_v2_pre.pth")
+    p.add_argument("--ckpt", type=str, default="./model_checkpoints/sac_pc_v2_exp.pth")
     p.add_argument("--eval_only", action="store_true")
     p.add_argument("--eval_runs", type=int, default=500)
     args = p.parse_args()

@@ -598,36 +598,6 @@ class SACPIAgent(NDaysNCampaignsAgent):
                 
             self.total_steps += 1
 
-# ══════════════════════════════════════
-# 4. training / evaluation helpers
-# ══════════════════════════════════════
-def train(eps: int, ckpt: str, ma_window: int = 100):
-    ag = SACPIAgent()
-    sim = AdXGameSimulator()
-    foes = [Tier1NDaysNCampaignsAgent(name=f"T1-{i}") for i in range(9)]
-    # foes = [BaselineAgent(name=f"Baseline-{i}") for i in range(9)]
-    
-    ma_queue = deque(maxlen=ma_window)
-    
-    for ep in range(1, eps + 1):
-        sim.run_simulation([ag] + foes, num_simulations=1)
-        
-        # 2. get final profit and update moving average
-        profit = ag.get_cumulative_profit()
-        ma_queue.append(profit)
-        ma = sum(ma_queue) / len(ma_queue)
-        
-        # 3. print stats
-        print(
-            f"[train] Ep {ep}/{eps}  "
-            f"Buf={len(ag.buffer):5d}  "
-            f"Profit={profit:7.2f}  "
-            f"MA{ma_window}={ma:7.2f}"
-        )
-        
-    ag._save(ckpt)
-    print("✔ saved", ckpt)
-
 class BaselineAgent(NDaysNCampaignsAgent):
 
     def __init__(self, name = "BaselineAgent"):
@@ -824,36 +794,4 @@ class BaselineAgent(NDaysNCampaignsAgent):
         
         return bids
 
-def evaluate(ckpt_file: str, num_runs: int = 500):
-    eval_agent = SACPIAgent(ckpt=ckpt_file, inference=True)
-    sim        = AdXGameSimulator()
-    foes       = [Tier1NDaysNCampaignsAgent(name=f"T1-{i}") for i in range(9)]
-
-    sim.run_simulation([eval_agent] + foes, num_simulations=num_runs)
-    
-def evaluate_v2(ckpt_file: str, num_runs: int = 500):
-    eval_agent = SACPIAgent(ckpt=ckpt_file, inference=True)
-    sim        = AdXGameSimulator()
-    foes       = [Tier1NDaysNCampaignsAgent(name=f"T1-0")]
-
-    sim.run_simulation([eval_agent] + foes, num_simulations=num_runs)
-
-my_agent_submission = SACPIAgent(ckpt="./model_checkpoints/sac_pc_v2_exp.pth", inference=True)
-
-# ══════════════════════════════════════
-# 5. CLI
-# ══════════════════════════════════════
-if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--train_eps", type=int, default=1000)
-    p.add_argument("--ckpt", type=str, default="sac_pc_v2_pre.pth")
-    p.add_argument("--eval_only", action="store_true")
-    p.add_argument("--eval_runs", type=int, default=500)
-    args = p.parse_args()
-
-    if args.eval_only:
-        evaluate(args.ckpt, args.eval_runs)
-        # evaluate_v2(args.ckpt, args.eval_runs)
-    else:
-        train(args.train_eps, args.ckpt)
-        evaluate(args.ckpt, args.eval_runs)
+my_agent_submission = SACPIAgent(ckpt="./model_checkpoints/sac_pc_v2_pre.pth", inference=True)
