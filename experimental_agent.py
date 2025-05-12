@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math, random, argparse, collections
-from typing import Dict, Set
+from typing import Dict, Set, Tuple
 from collections import deque
 
 import torch, torch.nn as nn, torch.nn.functional as F, torch.optim as optim
@@ -16,6 +16,7 @@ from agt_server.local_games.adx_arena import AdXGameSimulator
 import numpy as np
 # from .path_utils import path_from_local_root # For submission
 from path_utils import path_from_local_root  # For regular use
+from baseline_agents import BaselineAgent
 
 # ══════════════════════════════════════
 # 1. replay buffer
@@ -52,7 +53,7 @@ class PrioritizedReplayBuffer:
         assert self.size > 0, "Buffer is empty!"
         
         prios = self.priorities if self.size == self.capacity else self.priorities[:self.pos]
-        probs = prios ** self.alpha
+        probs = (prios + 1e-5) ** self.alpha
         probs /= probs.sum()
 
         indices = np.random.choice(len(probs), batch_size, p=probs)
@@ -84,102 +85,24 @@ class PrioritizedReplayBuffer:
 # ══════════════════════════════════════
 # 2. networks
 # ══════════════════════════════════════
-LOG_STD_MIN, LOG_STD_MAX = -20, 2
-
+LOG_STD_MIN, LOG_STD_MAX = -5, 1
 class GaussianPolicy(nn.Module):
-    def __init__(self, s_dim, a_dim, d_model=64, nhead=4, depth=2, mlp=256, dropout=0.1):
-        """
-        Args
-        ----
-        s_dim : number of scalar input features  (= sequence length)
-        a_dim : action dimension
-        d_model : embedding/channel width
-        """
+    def __init__(self, s_dim, a_dim, hidden=256):
         super().__init__()
-        self.s_dim = s_dim
-
-        self.val_embed = nn.Linear(1, d_model)               # value token
-        self.pos_embed = nn.Embedding(s_dim + 1, d_model)  # +1 for CLS token
-
-        self.dropout = nn.Dropout(dropout)
-
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=d_model*2,
-            batch_first=True,
-            norm_first=True,
-            dropout=dropout,
-        )
-        
-        self.encoder = nn.TransformerEncoder(enc_layer, depth)
-
-        # "CLS" style pooling: prepend learnable cls token
-        self.cls = nn.Parameter(torch.zeros(1, 1, d_model))
-        
-        self.head = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, mlp),
+        self.net = nn.Sequential(
+            nn.Linear(s_dim, hidden),
+            nn.LayerNorm(hidden),
             nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(mlp, mlp),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
             nn.SiLU(),
-            nn.Dropout(dropout),
         )
-        self.mu = nn.Linear(mlp, a_dim)
-        self.log_std = nn.Linear(mlp, a_dim)
-        
-        self._init_weights()
+        self.mu = nn.Linear(hidden, a_dim)
+        self.log_std = nn.Linear(hidden, a_dim)
 
-
-    def _init_weights(self):
-        # Initialization following Transformer defaults
-        nn.init.normal_(self.cls, std=0.02)
-        nn.init.xavier_uniform_(self.val_embed.weight)
-        nn.init.zeros_(self.val_embed.bias)
-        nn.init.xavier_uniform_(self.pos_embed.weight)
-        for m in self.head:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
-
-
-    def forward(self, s: torch.Tensor):
-        """
-        Compute mu and log_std for a batch of states.
-
-        Args:
-            s (Tensor): [B, s_dim] input features.
-
-        Returns:
-            mu (Tensor): [B, a_dim] action means.
-            log_std (Tensor): [B, a_dim] log standard deviations.
-        """
-        B, S = s.size()
-        # Value token embeddings
-        x = s.unsqueeze(-1)  # [B, S, 1]
-        val_tokens = self.val_embed(x)  # [B, S, d_model]
-
-        # Positional embeddings (first idx 0 reserved for CLS)
-        positions = torch.arange(1, S + 1, device=s.device).unsqueeze(0)
-        pos_tokens = self.pos_embed(positions)  # [1, S, d_model]
-
-        tok = val_tokens + pos_tokens
-
-        # Prepend CLS token
-        cls = self.cls.expand(B, -1, -1)  # [B,1,d_model]
-        seq = torch.cat([cls, tok], dim=1)       # [B, S+1, d_model]
-        seq = self.dropout(seq)
-
-        # Transformer encoding and CLS pooling
-        encoded = self.encoder(seq)             # [B, S+1, d_model]
-        h = encoded[:, 0]                       # [B, d_model]
-
-        # MLP head
-        z = self.head(h)                        # [B, mlp_dim]
-        mu = self.mu(z)
-        log_std = self.log_std(z).clamp(LOG_STD_MIN, LOG_STD_MAX)
-        return mu, log_std
+    def forward(self, s):
+        x = self.net(s)
+        return self.mu(x), self.log_std(x).clamp(LOG_STD_MIN, LOG_STD_MAX)
     
     def sample(self, s):
         mu, log_std = self(s)
@@ -192,59 +115,32 @@ class GaussianPolicy(nn.Module):
         ).sum(-1, keepdim=True)
         return a, logp
     
-class TimeSeriesEncoder(nn.Module):
-    def __init__(self, k: int, hidden: int):
-        super().__init__()
-        # GRU over last k days of [reach, spend]
-        self.gru = nn.GRU(input_size=2, hidden_size=hidden, batch_first=True)
-    def forward(self, hist: torch.Tensor):
-        # hist: [B, k, 2]
-        _, h = self.gru(hist)     # h: [1, B, hidden]
-        return h.squeeze(0)       # [B, hidden]
-
 class QNet(nn.Module):
-    def __init__(self, s_dim: int, a_dim: int, hidden: int = 128):
+    def __init__(self, s_dim, a_dim, hidden=256):
         super().__init__()
-        self.f = nn.Sequential(
-            nn.Linear(s_dim + a_dim, hidden),
-            nn.ReLU(),
+        self.net = nn.Sequential(
+            nn.Linear(s_dim+a_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.SiLU(),
             nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, 1),
+            nn.LayerNorm(hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1)
         )
+    
+    def forward(self, s, a):
+        return self.net(torch.cat([s,a], -1))
 
-    def forward(self, s, a): return self.f(torch.cat([s, a], -1))
-
-
-# ══════════════ Pop-Art normaliser ══════════════
-class PopArt(nn.Module):
-    def __init__(self, beta=0.99999):
-        super().__init__()
-        self.mu  = nn.Parameter(torch.zeros(1), requires_grad=False)
-        self.sig = nn.Parameter(torch.ones(1),  requires_grad=False)
-        self.beta= beta
-
-    def forward(self, x):
-        # x is a tensor shape [1]
-        with torch.no_grad():
-            d = 1 - self.beta
-            new_mu  = self.beta * self.mu + d * x.mean()
-            new_var = (
-                self.beta * (self.sig**2 + self.mu**2)
-              + d * (x**2).mean()
-              - new_mu**2
-            )
-            self.mu.data.copy_(new_mu)
-            self.sig.data.copy_(torch.sqrt(new_var + 1e-6))
-        return (x - self.mu) / self.sig
 
 # ══════════════════════════════════════
 # 3. SAC agent with per-campaign rewards
 # ══════════════════════════════════════
-MAX_CAMPAIGNS = 10
 GAME_LENGTH = 10.0
 
-class SACPerCampaign(NDaysNCampaignsAgent):
+class SACPIAgent(NDaysNCampaignsAgent):
     S_DIM, A_DIM = 12, 2
 
     # memory entry for campaign c chosen yesterday
@@ -252,46 +148,37 @@ class SACPerCampaign(NDaysNCampaignsAgent):
         "MemEntry", ("state", "action", "prev_reach", "prev_cost", "end_day", "uid")
     )
 
-    def __init__(self, ckpt: str | None = None, inference=False, n_critics=5):
+    def __init__(self, ckpt: str | None = None, inference=False):
         super().__init__()
-        self.name = "SAC_PC"
+        self.name = "Probably Working Agent"
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         hid = 256
         self.actor = GaussianPolicy(self.S_DIM, self.A_DIM).to(self.device)
-        self.qs = nn.ModuleList([QNet(self.S_DIM, self.A_DIM, hid) for _ in range(n_critics)]).to(self.device)
-        self.targets = nn.ModuleList([QNet(self.S_DIM, self.A_DIM, hid) for _ in range(n_critics)]).to(self.device)
-        for q, t in zip(self.qs, self.targets):
-                    t.load_state_dict(q.state_dict())
+        self.q1 = QNet(self.S_DIM, self.A_DIM, hid).to(self.device)
+        self.q2 = QNet(self.S_DIM, self.A_DIM, hid).to(self.device)
+        self.t1 = QNet(self.S_DIM, self.A_DIM, hid).to(self.device)
+        self.t2 = QNet(self.S_DIM, self.A_DIM, hid).to(self.device)
+        self.t1.load_state_dict(self.q1.state_dict())
+        self.t2.load_state_dict(self.q2.state_dict())
 
         a_lr = 1e-4
-        q_lr = 4e-4
+        q_lr = 3e-4
         self.o_actor = optim.Adam(self.actor.parameters(), a_lr)
-        self.q_optimizers = [optim.Adam(q.parameters(), lr=q_lr) for q in self.qs]
+        self.o_q1 = optim.Adam(self.q1.parameters(), q_lr)
+        self.o_q2 = optim.Adam(self.q2.parameters(), q_lr)
         self.log_alpha = torch.tensor(0.0, device=self.device, requires_grad=True)
-        self.o_alpha = optim.Adam([self.log_alpha], 5e-5) # We tune α to control exploration. A smaller LR here prevents wild swings in temperature, stabilizing stochasticity in bids.
+        self.o_alpha = optim.Adam([self.log_alpha], 1e-4)
 
-        # a high γ still gives nonzero weight to “tomorrow,” but slightly lower than 0.995 avoids over-valuing distant outcomes that rarely exist.
-        # A smaller τ makes targets update more responsively—important when episodes are short, so we want up-to-date bootstrapping.
-        self.gamma, self.tau = 0.98, 0.003
-        
-        # Performing 8 gradient steps per environment interaction amplifies learning signal from each batch—helpful when data is costly to collect (campaign days only tick forward once per step)
-        self.batch, self.update_after, self.updates_ps = 256, 512, 6
-        
-        # Updating the actor every critic step (delay=1) accelerates policy improvement. In a short-horizon task, you want to quickly translate better Q-estimates into improved bidding behavior.
-        self.policy_delay = 1 
+        self.gamma, self.tau = 0.95, 0.005
+        self.batch, self.update_after, self.updates_ps = 128, 256, 2
+
         self.target_entropy = -float(self.A_DIM)
-        self.popart = PopArt().to(self.device)
         
-        self.per_alpha = 0.6
-
         self.buffer = PrioritizedReplayBuffer(
-            capacity=100_000,
-            alpha=self.per_alpha,
-            device=self.device
+            capacity=100_000, alpha=0.6, device=self.device
         )
-        
-        self.mem: Dict[int, SACPerCampaign.MemEntry] = {}
+        self.mem: Dict[int, SACPIAgent.MemEntry] = {}
 
         self.total_steps = 0
         self.inference = inference
@@ -301,12 +188,7 @@ class SACPerCampaign(NDaysNCampaignsAgent):
         if ckpt and inference:
             self._load(ckpt)
             self.inference = True
-        
-        # For EMA Normalization
-        self.r_beta = 0.999
-        self.r_mean = 0.0
-        self.r_var  = 1.0
-        
+
         # For Campaign Segmentation
         self.SEGMENT_FREQ = {
             # --------- triple-attribute segments (8) ---------
@@ -332,18 +214,29 @@ class SACPerCampaign(NDaysNCampaignsAgent):
             MarketSegment({'Female','LowIncome'}):         4381,
             MarketSegment({'Male','HighIncome'}):          1325,
             MarketSegment({'Female','HighIncome'}):         663,
-
-            # --------- single-attribute segments (6) ---------
-            MarketSegment({'Male'}):                       4956,
-            MarketSegment({'Female'}):                     5044,
-            MarketSegment({'Young'}):                      4589,
-            MarketSegment({'Old'}):                        5411,
-            MarketSegment({'LowIncome'}):                  8012,
-            MarketSegment({'HighIncome'}):                 1988,
         }
 
         self.TOTAL_DAILY_USERS = 10_000        # given in the hand-out
         
+        # max simultaneous active campaigns
+        self.max_running = 10
+        self.baseline_cpi = 0.2
+
+        # EMA smoothing factor for CPI
+        self.ema_alpha = 0.2
+        # Per-segment current CPI estimate (initialized to baseline_cpi)
+        self.segment_cpi: Dict[MarketSegment, float] = {
+            seg: self.baseline_cpi for seg in self.SEGMENT_FREQ
+        }
+        # Previous-day totals for reach and cost per segment
+        self._seg_prev_totals: Dict[MarketSegment, Tuple[float, float]] = {
+            seg: (0.0, 0.0) for seg in self.SEGMENT_FREQ
+        }
+        
+        self._all_campaigns: Dict[int, Campaign] = {}
+        
+        self.global_reward_ema   = 0.0
+        self.reward_ema_beta     = 0.8    # tune between 0.8 and 0.95
         
     # ── α helper ──
     @property
@@ -360,48 +253,116 @@ class SACPerCampaign(NDaysNCampaignsAgent):
         print("Loading checkpoint from", ckpt_path)
         ck = torch.load(ckpt_path, map_location=self.device)
         self.actor.load_state_dict(ck["actor"])
+        
+    def _update_segment_cpi_from_deltas(self):
+        new_totals = {}
+
+        for seg in self.SEGMENT_FREQ:
+            # total impressions & cost delivered so far in this segment
+            tot_reach = 0.0
+            tot_cost = 0.0
+
+            for c in self._all_campaigns.values():
+                if c.target_segment != seg:
+                    continue
+                # skip assigned deals if you want only auctioned
+                if c.reach == c.budget:
+                    continue
+                
+                tot_reach += self.get_cumulative_reach(c)
+                tot_cost  += self.get_cumulative_cost(c)
+                    
+            prev_reach, prev_cost = self._seg_prev_totals[seg]
+            dr = tot_reach - prev_reach
+            dc = tot_cost  - prev_cost
+
+            if dr > 1e-6 and dc > 0.0:
+                observed_price = dc / dr
+                # clamp to avoid outliers
+                observed_price = float(np.clip(observed_price, 0.001, 10.0))
+                old_cpi = self.segment_cpi[seg]
+                self.segment_cpi[seg] = (
+                    (1 - self.ema_alpha) * old_cpi
+                    + self.ema_alpha * observed_price
+                )
+                
+            new_totals[seg] = (tot_reach, tot_cost)
+
+        self._seg_prev_totals = new_totals
+
+    def get_baseline_cpi(self, segment: MarketSegment) -> float:
+        """Returns the current EMA-based CPI for the given segment."""
+        return self.segment_cpi.get(segment, 0.0)
     
-
-    def _state_c(self, c: Campaign, n_norm, avg_p, min_p, max_p, avg_b, min_b, max_b, ends_ratio) -> torch.Tensor:
-        day_n = self.get_current_day() / GAME_LENGTH
-        r_now = self.get_cumulative_reach(c)
-        c_now = self.get_cumulative_cost(c)
-
-        # per-campaign
-        prog   = r_now / max(1, c.reach)
-        rem_b  = (c.budget - c_now) / max(1.0, c.budget)
-        days_l = (c.end_day - self.get_current_day() + 1) / GAME_LENGTH
-        length = (c.end_day - c.start_day + 1) / 3.0
-
-        baseline = (c.budget - c_now) / max(1, c.reach - r_now)
-        cpi      = c_now / max(1, r_now)
-
-        x,a,b = r_now / max(1, c.reach), 4.08577, 3.08577
-        slope = (a / (1 + (a*x - b)**2)) / c.reach
         
-        urg   = 1.0 / max(1, c.end_day - self.get_current_day() + 1)
-        qs = self.get_quality_score()
+    def _state_c(self,c : Campaign, n_norm, avg_p, min_p, max_p, avg_b, min_b, max_b, ends_ratio) -> torch.Tensor:
+        """
+        Per-campaign + global state for SAC:
+        — Global time & market context
+        — Campaign urgency & capacity
+        — Bid anchors (baseline vs. realized CPI)
+        — Creative quality
+        """
+        D       = GAME_LENGTH
+        today   = self.get_current_day()
 
-        dq = self.get_quality_score() - getattr(self, "_last_Q", self.get_quality_score())
-        self._last_Q = self.get_quality_score()
+        # 1) Global context (shared across campaigns)
+        day_frac    = today / D                 # how far into the 10-day game
+        market_imp  = n_norm                    # normalized impressions so far
+        market_cpi  = avg_p                     # avg clearing price today
+        market_bid  = avg_b                     # avg bid price today
 
-        # [day_n, n_norm, avg_p, min_p, max_p, prog * urg, rem_b, qs] => 8
-        # [day_n, n_norm, avg_p, avg_b, ends_ratio, prog, rem_b, days_l, baseline, cpi, slope, qs] => 12
-        # [day_n, n_norm, avg_p, min_p, max_p, avg_b, min_b, max_b, ends_ratio, prog, rem_b, days_l, length, baseline, cpi, slope, dq, qs] => 18
+        # 2) Campaign delivery & time
+        delivered   = self.get_cumulative_reach(c)
+        spent       = self.get_cumulative_cost(c)
+        prog_frac   = delivered / c.reach       # % of reach already delivered
+        rem_reach   = c.reach - delivered
+        rem_budget  = c.budget - spent
+        rem_days    = max(1, c.end_day - today + 1)
+        days_frac   = rem_days / D              # % of game time left
+
+        # 3) Market supply & pacing
+        supply      = self.SEGMENT_FREQ[c.target_segment]
+        pace_ratio  = rem_reach / (supply * rem_days)
+        pace_mul    = 0.6 + 0.8 * np.tanh(2 * pace_ratio)
+
+        # 4) Bid anchors
+        true_vpi     = rem_budget / max(1.0, rem_reach)      # actual $ value/impression left => [0, 1]
+        realized_cpi = spent / max(1.0, delivered)           # what we’ve actually paid so far
+
+        # 5) Creative quality
+        Q            = self.get_quality_score()              # [0,1] higher = better ad
+
+        features = [
+            # ── global / market ─────────────────────────
+            day_frac,
+            market_imp,
+            market_cpi,
+            market_bid,
+            ends_ratio,
+
+            # ── campaign timing & pacing ────────────────
+            prog_frac,
+            rem_budget  / c.budget,    # remaining budget ratio
+            days_frac,
+            pace_mul,
+
+            # ── bid anchors ─────────────────────────────
+            true_vpi,
+            realized_cpi,
+
+            # ── quality ────────────────────────────────
+            Q,
+        ]
         
-        scalars = [day_n, n_norm, avg_p, avg_b, ends_ratio, prog, rem_b, days_l, baseline, cpi, slope, qs]
-
-        s = torch.tensor(scalars, dtype=torch.float32, device=self.device)
-        return s
-        
-        # seg_id = torch.tensor(self._seg_id(c.target_segment), device=self.device)
-        # seg_vec = self.seg_emb(seg_id)
-
-        # return torch.cat([s, seg_vec], dim=-1)  # → (29,)
+        return torch.tensor(features, dtype=torch.float32, device=self.device)
 
     # ── reset episode mem ──
     def on_new_game(self):
         self.mem.clear()
+        for seg in self.SEGMENT_FREQ:
+            self._seg_prev_totals[seg] = (0.0, 0.0)
+        self._all_campaigns.clear()
 
     # ── main bidding function ──
     def get_ad_bids(self) -> Set[BidBundle]:
@@ -409,7 +370,8 @@ class SACPerCampaign(NDaysNCampaignsAgent):
         
         active  = list(self.get_active_campaigns())
         day     = self.get_current_day()
-        n_norm  = len(active) / MAX_CAMPAIGNS
+        n_norm  = len(active) / self.max_running
+        Q = self.get_quality_score()
 
         # 1) progress & budget ratios
         reaches = [self.get_cumulative_reach(c)/c.reach for c in active] or [0.0]
@@ -418,7 +380,7 @@ class SACPerCampaign(NDaysNCampaignsAgent):
         avg_b, min_b, max_b = map(float, (np.mean(budgets), np.min(budgets), np.max(budgets)))
 
         # 2) endings today
-        ends_ratio = sum(1 for c in active if c.end_day == day) / MAX_CAMPAIGNS
+        ends_ratio = sum(1 for c in active if c.end_day == day) / self.max_running
 
         if not self.inference:
             active_map = {c.uid: c for c in active}
@@ -430,36 +392,29 @@ class SACPerCampaign(NDaysNCampaignsAgent):
                 
                 if camp is None or day > camp.end_day:
                     # use last known state; reward is zero because reach & cost no longer change
-                    self.buffer.push(m.state, m.action, 0.0,
-                                    torch.zeros_like(m.state), 1.0)
+                    self.buffer.push(m.state.detach(), m.action.detach(), 0.0, torch.zeros_like(m.state), 1.0)
                     self.mem.pop(uid, None)
                     continue
 
                 new_reach = self.get_cumulative_reach(camp)
                 new_cost = self.get_cumulative_cost(camp)
-                
-                delta_cost = new_cost - m.prev_cost # change in cost
-                eff_prev = self.effective_reach(m.prev_reach, camp.reach)
-                eff_new = self.effective_reach(new_reach, camp.reach)
-                
-                raw_reward = (eff_new - eff_prev) * camp.budget - delta_cost # reward = budget * reach - cost
-                
-                # Pop-Art normalization
-                reward = self.popart(torch.tensor([raw_reward], dtype=torch.float32, device=self.device))[0]
-                reward = reward.item()  # convert to scalar
-                
-                # NaN / inf guard
-                if not math.isfinite(reward):
-                    reward = torch.tensor(0.0, device=self.device)
+
+                delta_reach = (new_reach - m.prev_reach) / max(1.0, camp.reach)
+                delta_cost = ((new_cost - m.prev_cost) / max(1.0, camp.budget))
+
+                raw_reward = 4 * delta_reach - 2 * delta_cost + 1 * (Q - 0.5)
+
+                # Update the global EMA
+                β = self.reward_ema_beta
+                self.global_reward_ema = β*self.global_reward_ema + (1-β)*raw_reward
+
+                # Compute a centered (advantage‐like) reward
+                reward = raw_reward - self.global_reward_ema
 
                 done = float(self.get_current_day() >= camp.end_day)
                 next_state = (torch.zeros_like(m.state) if done else self._state_c(camp, n_norm, avg_p, min_p, max_p, avg_b, min_b, max_b, ends_ratio))
                 
-                self.buffer.push(m.state, 
-                                m.action, 
-                                reward, 
-                                next_state, 
-                                done)
+                self.buffer.push(m.state.detach(), m.action.detach(), reward, next_state.detach(), done)
 
                 # remove entry if campaign ended
                 if done: 
@@ -470,6 +425,8 @@ class SACPerCampaign(NDaysNCampaignsAgent):
 
         # 2. choose action for each currently active campaign
         for c in active:
+            self._all_campaigns[c.uid] = c
+            
             cum, cost = self.get_cumulative_reach(c), self.get_cumulative_cost(c)
             
             if cum >= c.reach or cost >= c.budget:  # no need to bid
@@ -484,22 +441,20 @@ class SACPerCampaign(NDaysNCampaignsAgent):
                     action = torch.tanh(mu)
                 else:
                     action, _ = self.actor.sample(s_c)
-                    
-            action = action.squeeze(0)
-            bid_mul, lim_mul = 0.5 + 0.5 * action[0].item(), 0.5 + 0.5 * action[1].item()
-
+            
             rem_reach = max(1, c.reach - cum)
             rem_budget = max(1e-6, c.budget - cost)
             
-            base = rem_budget / rem_reach
-            base = float(np.clip(base, 0.10, 10.0))       # 10 USD CPM hard-cap
-            bid = float(np.clip(base * bid_mul, 0.10, min(10.0, rem_budget)))
-            limit = float(np.clip(rem_budget * lim_mul, bid, rem_budget))
+            baseline = rem_budget / max(1, rem_reach)
+            baseline_spend_limit = rem_budget
             
-            # base = rem_budget / rem_reach
-            # base = float(min(max(base, 0.1), rem_budget)) # clip to [0.1, rem_budget] ?
-            # bid = float(min(max(base * bid_mul, 0.1), rem_budget)) # clip to [0.1, rem_budget]
-            # limit = float(min(max(rem_budget * lim_mul, bid), rem_budget)) # clip to [bid, rem_budget] ?
+            action = action.squeeze(0)
+
+            bid_mul = 0.6 + 0.5 * (action[0].item())  # action[0] ∈ [-1,1] → bid_mul ∈ [0.1, 1.1]
+            lim_mul = 0.6 + 0.4 * (action[1].item())  # action[1] ∈ [-1,1] → lim_mul ∈ [0.2, 1.0]
+            
+            bid = float(np.clip(baseline * bid_mul, 0.1, c.reach))
+            limit = max(bid, min(rem_budget, baseline_spend_limit * lim_mul))
 
             bid_entry = Bid(self, c.target_segment, bid, limit)
             bundles.add(BidBundle(c.uid, limit, {bid_entry}))
@@ -517,90 +472,141 @@ class SACPerCampaign(NDaysNCampaignsAgent):
         # learn from replay buffer
         self._learn()
         return bundles
+
+    # ---------- rule-based campaign auction ----------
+    def get_campaign_bids(self, campaigns_for_auction: Set[Campaign]) -> Dict[Campaign, float]:
+        self._update_segment_cpi_from_deltas()
+        
+        # for seg in self.SEGMENT_FREQ:
+        #     print(f"Segment {seg}: Current CPI: {self.segment_cpi[seg]:.2f}")
+        
+        Q = self.get_quality_score()
+        
+        slots = self.max_running - len(self.get_active_campaigns())
+        if slots <= 0:
+            return {}
+
+        ranked = []
+
+        for c in campaigns_for_auction:
+            # ---------- basic constants -----------------------------------
+            D         = c.end_day - c.start_day + 1
+            seg       = c.target_segment
+            
+            # ---------- difficulty: share of daily inventory needed -------
+            supply    = self.SEGMENT_FREQ[seg]            # avg imp / day
+            frac      = c.reach / max(1, supply * D)            # 0 … >1
+            
+            if frac > 1.0:
+                continue                                 # infeasible campaign
+            
+            base_cpi = self.get_baseline_cpi(seg)
+            V = c.reach * base_cpi         # Ties “willingness‑to‑pay” to a constant CPI (self.baseline_cpi)
+            
+            diff_mul  = 0.6 + 0.6 * frac     # pay up to 20 % more for hard jobs
+
+            if np.random.rand() < 0.10:
+                diff_mul *= np.random.uniform(0.7, 0.9)  # learn cheap wins
+            
+            # ---------- one‑shot bid (bounded by budget) ------------------
+            raw_bid = V * diff_mul / max(Q, 1e-6)
+            bid     = self.clip_campaign_bid(c, raw_bid)
+            
+            # print(f"Campaign {c.uid}: "
+            #         f"Segment CPI: {base_cpi:.2f}, "
+            #         f"Difficulty: {diff_mul:.2f}, "
+            #         f"Reach: {c.reach:.2f}, "
+            #         f"Raw Bid: {raw_bid:.2f}, "
+            #         f"Bid: {bid:.2f}, "
+            #         f"factor: {base_cpi * diff_mul / max(Q, 1e-6):.2f}, "
+            #         f"Effective CPI: {bid / c.reach:.2f}")
+            
+            expected_reach = c.reach / (base_cpi + 1e-6)
+            roi = expected_reach / bid
+            ranked.append((roi, c, bid))
+            
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        selected = ranked[:slots]
+        bids = {c: bid for _, c, bid in selected}
+        
+        return bids
     
     # ── SAC update ──
     def _learn(self):
         if self.inference or len(self.buffer) < max(self.batch, self.update_after):
             return
-        
-        beta = min(1.0, 0.4 + self.total_steps * (1.0 - 0.4) / 100000)  # linear β-annealing
 
         for _ in range(self.updates_ps):
-            s, a, r, s2, d, idxs, weights = self.buffer.sample(self.batch, beta)
-        
-            # ── target Q with n-step γⁿ ──
+            beta       = 0.4 + min(1.0, self.total_steps / 100_000) * (1.0 - 0.4)
+            
+            s, a, r, s2, d, idxs, is_weights = self.buffer.sample(self.batch, beta=beta)
+
+            # target policy smoothing
             with torch.no_grad():
                 a2, lp2 = self.actor.sample(s2)
-                noise   = (torch.randn_like(a2) * 0.2).clamp(-0.5, 0.5)
-                a2      = (a2 + noise).clamp(-1, 1)
-                q_tgts = [t(s2, a2) for t in self.targets]
-                # take the element-wise minimum over the ensemble
-                min_q_tgt = torch.min(torch.cat(q_tgts, dim=1), dim=1, keepdim=True)[0]
-                y       = r + (1 - d) * self.gamma * (min_q_tgt - self.alpha * lp2)
-
-            # ── critic updates (weighted MSE) ──
-            td_errors = []
-            for i, (q, opt) in enumerate(zip(self.qs, self.q_optimizers)):
-                q_pred = q(s, a)
-                td    = y - q_pred
-                loss  = (weights * td.pow(2)).mean()
-                opt.zero_grad(); loss.backward(); opt.step()
-                td_errors.append(td.abs().mean(dim=1).detach())
-
-                # update its target
-                with torch.no_grad():
-                    for p, tp in zip(q.parameters(), self.targets[i].parameters()):
-                        tp.data.mul_(1-self.tau).add_(self.tau*p.data)
-        
-            # ---- update PER priorities (use average TD-error) ----
-            new_prios = torch.stack(td_errors, dim=1).mean(dim=1).cpu().numpy()
-            self.buffer.update_priorities(idxs, new_prios + 1e-6)
-
-            # ── actor + α ──
-            if self.total_steps % self.policy_delay == 0:
-                an, lp = self.actor.sample(s)
-                q_values = [q(s, an) for q in self.qs]
-                q_min = torch.min(torch.cat(q_values, dim=1), dim=1, keepdim=True)[0]
-                a_loss = (self.alpha * lp - q_min).mean()
+                noise = torch.randn_like(a2) * 0.1
+                noise = torch.clamp(noise, -0.2, 0.2)
+                a2 = (a2 + noise).clamp(-1, 1)
                 
-                self.o_actor.zero_grad(); a_loss.backward()
-                nn.utils.clip_grad_norm_(self.actor.parameters(), 5)
-                self.o_actor.step()
+                # target policy entropy
+                target_q = torch.min(self.t1(s2, a2), self.t2(s2, a2))
+                y = r + self.gamma * (1 - d) * (target_q - self.alpha * lp2)
 
-                alpha_loss = -(self.log_alpha * (lp + self.target_entropy).detach()).mean()
-                self.o_alpha.zero_grad(); alpha_loss.backward(); self.o_alpha.step()
+            # update critics
+            td_errors = []
+            for q, opt, targ in ((self.q1,self.o_q1,self.t1),(self.q2,self.o_q2,self.t2)):
+                q_pred = q(s,a)
+                # q_pred = self.popart(q_pred)
+                se     = (q_pred - y).pow(2)
+                loss   = (is_weights * se).mean()
+                
+                opt.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(q.parameters(),1.)
+                opt.step()
+                
+                with torch.no_grad():
+                    td_errors.append((q_pred - y).abs().squeeze().cpu())
+                    for p, tp in zip(q.parameters(), targ.parameters()):
+                        tp.data.mul_(1-self.tau).add_(self.tau*p.data)
+                # print(f"Critic loss: {loss.item():.4f}")
 
+            new_prios = torch.max(torch.stack(td_errors, dim=1), dim=1)[0]
+            self.buffer.update_priorities(idxs, new_prios.numpy())
+
+            an, lp = self.actor.sample(s)
+            q_min  = torch.min(self.q1(s,an), self.q2(s,an))
+            a_loss = (self.alpha*lp - q_min).mean()
+            self.o_actor.zero_grad()
+            a_loss.backward()
+            nn.utils.clip_grad_norm_(self.actor.parameters(),5.)
+            self.o_actor.step()
+
+            alpha_loss = -(self.log_alpha * (lp.detach() + self.target_entropy)).mean()
+            self.o_alpha.zero_grad()
+            alpha_loss.backward()
+            self.o_alpha.step()
+            
+            if self.total_steps % 200 == 0:
+                print(f"Step {self.total_steps}:")
+                print(f"Avg Reward: {r.mean().item():.4f}")
+                print(f"Actor loss: {a_loss.item():.4f}  Alpha loss: {alpha_loss.item():.4f}")
+                print(f"Critic loss: {loss.item():.4f}  Target Q: {target_q.mean().item():.4f}")
+                print(f"Alpha: {self.alpha.item():.4f}  Target entropy: {self.target_entropy:.4f}")
+                print(f"Log alpha: {self.log_alpha.item():.4f}  Log std: {self.actor.log_std.weight.data.mean().item():.4f}")
+                for seg in self.SEGMENT_FREQ:
+                    print(f"Segment {seg}: Current CPI: {self.segment_cpi[seg]:.2f}")
+                
             self.total_steps += 1
-            if self.total_steps % 1000 == 0:
-                print(
-                    f"[learn] step {self.total_steps}  "
-                    f"α={self.alpha.item():.2f}  "
-                    f"loss={loss.item():.2f}  "
-                    f"actor_loss={a_loss.item():.2f}  "
-                    f"alpha_loss={alpha_loss.item():.2f}"
-                )
-        
-    # ---------- rule-based campaign auction ----------
-    def get_campaign_bids(self, campaigns_for_auction: Set[Campaign]) -> Dict[Campaign, float]:
-        bids = {}
-        day = self.get_current_day()
-        Q = self.get_quality_score()
-        for c in campaigns_for_auction:
-            min_bid = 0.1 * c.reach
-            max_bid = c.reach
-            base = min_bid if Q >= 1 else min_bid + (max_bid - min_bid) * (1 - Q)
-            if day >= 7:
-                base *= 1.15
-            bids[c] = self.clip_campaign_bid(c, base)
-        return bids
 
 # ══════════════════════════════════════
 # 4. training / evaluation helpers
 # ══════════════════════════════════════
 def train(eps: int, ckpt: str, ma_window: int = 100):
-    ag = SACPerCampaign()
+    ag = SACPIAgent()
     sim = AdXGameSimulator()
     foes = [Tier1NDaysNCampaignsAgent(name=f"T1-{i}") for i in range(9)]
+    # foes = [BaselineAgent(name=f"Baseline-{i}") for i in range(9)]
     
     ma_queue = deque(maxlen=ma_window)
     
@@ -620,21 +626,18 @@ def train(eps: int, ckpt: str, ma_window: int = 100):
             f"MA{ma_window}={ma:7.2f}"
         )
         
-        ag.on_new_game()
-        
     ag._save(ckpt)
     print("✔ saved", ckpt)
 
-
 def evaluate(ckpt_file: str, num_runs: int = 500):
-    eval_agent = SACPerCampaign(ckpt=ckpt_file, inference=True)
+    eval_agent = SACPIAgent(ckpt=ckpt_file, inference=True)
     sim        = AdXGameSimulator()
     foes       = [Tier1NDaysNCampaignsAgent(name=f"T1-{i}") for i in range(9)]
 
     sim.run_simulation([eval_agent] + foes, num_simulations=num_runs)
     
 def evaluate_v2(ckpt_file: str, num_runs: int = 500):
-    eval_agent = SACPerCampaign(ckpt=ckpt_file, inference=True)
+    eval_agent = SACPIAgent(ckpt=ckpt_file, inference=True)
     sim        = AdXGameSimulator()
     foes       = [Tier1NDaysNCampaignsAgent(name=f"T1-0")]
 
@@ -648,7 +651,7 @@ def evaluate_v2(ckpt_file: str, num_runs: int = 500):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--train_eps", type=int, default=1000)
-    p.add_argument("--ckpt", type=str, default="sac_pc_v2_exp.pth")
+    p.add_argument("--ckpt", type=str, default="sac_pc_v2_pre.pth")
     p.add_argument("--eval_only", action="store_true")
     p.add_argument("--eval_runs", type=int, default=500)
     args = p.parse_args()
